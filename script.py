@@ -2,8 +2,8 @@ import os
 import numpy as np
 from paddleocr import PaddleOCR
 from pdf2image import convert_from_path
-from transformers import pipeline, BartForConditionalGeneration, BartTokenizer
 import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
 from gtts import gTTS
 from moviepy.editor import *
@@ -12,8 +12,13 @@ from pydub import AudioSegment
 from scipy.io import wavfile
 import librosa
 import cv2
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+
+# Load Airoboros model
+def load_airoboros_model():
+    model_name = "jondurbin/airoboros-l2-70b-gpt4-1.4.1"
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, device_map="auto", trust_remote_code=True)
+    return model, tokenizer
 
 # 1. Input Processing
 def extract_text_from_pdf(pdf_path):
@@ -26,30 +31,47 @@ def extract_text_from_pdf(pdf_path):
             text += line[1][0] + "\n"
     return text
 
-def summarize_text(text):
-    summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
-    chunks = [text[i:i+1024] for i in range(0, len(text), 1024)]
+def chunk_text(text, max_length=2000):
+    words = text.split()
+    chunks = []
+    current_chunk = []
+    current_length = 0
+    for word in words:
+        if current_length + len(word) + 1 > max_length:
+            chunks.append(" ".join(current_chunk))
+            current_chunk = [word]
+            current_length = len(word)
+        else:
+            current_chunk.append(word)
+            current_length += len(word) + 1
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+    return chunks
+
+def summarize_with_airoboros(model, tokenizer, text):
+    chunks = chunk_text(text)
     summaries = []
     for chunk in chunks:
-        summary = summarizer(chunk, max_length=150, min_length=50, do_sample=False)
-        summaries.append(summary[0]['summary_text'])
+        prompt = f"Summarize the following text concisely:\n\n{chunk}\n\nSummary:"
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        outputs = model.generate(**inputs, max_new_tokens=150, temperature=0.7)
+        summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        summaries.append(summary.split("Summary:")[1].strip())
     return " ".join(summaries)
 
-def generate_script(text):
-    model = BartForConditionalGeneration.from_pretrained("facebook/bart-large-cnn")
-    tokenizer = BartTokenizer.from_pretrained("facebook/bart-large-cnn")
-    inputs = tokenizer([text], max_length=1024, return_tensors="pt")
-    summary_ids = model.generate(inputs["input_ids"], num_beams=4, min_length=100, max_length=300)
-    script = tokenizer.batch_decode(summary_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-    return script
+def generate_script_with_airoboros(model, tokenizer, summary):
+    prompt = f"Based on the following summary, create a detailed script for a video presentation:\n\n{summary}\n\nScript:"
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    outputs = model.generate(**inputs, max_new_tokens=500, temperature=0.7)
+    script = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return script.split("Script:")[1].strip()
 
-def extract_key_points(text, n=5):
-    sentences = text.split('.')
-    vectorizer = TfidfVectorizer().fit_transform(sentences)
-    similarities = cosine_similarity(vectorizer)
-    scores = similarities.sum(axis=1)
-    top_idx = scores.argsort()[-n:][::-1]
-    return [sentences[i].strip() for i in top_idx]
+def extract_key_points(model, tokenizer, summary, n=5):
+    prompt = f"Extract {n} key points from the following summary:\n\n{summary}\n\nKey points:"
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    outputs = model.generate(**inputs, max_new_tokens=200, temperature=0.7)
+    key_points = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return key_points.split("Key points:")[1].strip().split("\n")
 
 # 2. Prompt Generation
 def generate_prompts(key_points):
@@ -77,20 +99,13 @@ def generate_voiceover(script):
     tts = gTTS(text=script, lang='en', slow=False)
     tts.save("temp_voiceover.mp3")
     
-    # Convert mp3 to wav for further processing
     sound = AudioSegment.from_mp3("temp_voiceover.mp3")
     sound.export("voiceover.wav", format="wav")
     
-    # Load the wav file
     y, sr = librosa.load("voiceover.wav")
-    
-    # Noise reduction
     y_reduced_noise = librosa.effects.remix(y, intervals=librosa.effects.split(y, top_db=20))
-    
-    # Speed up the audio slightly
     y_fast = librosa.effects.time_stretch(y_reduced_noise, rate=1.1)
     
-    # Save the processed audio
     wavfile.write("processed_voiceover.wav", sr, (y_fast * 32767).astype(np.int16))
     
     return "processed_voiceover.wav"
@@ -104,15 +119,12 @@ def create_video(images, voiceover_path, output_path):
     for img in images:
         img_array = np.array(img)
         img_clip = ImageClip(img_array).set_duration(duration/len(images))
-        
-        # Add zoom effect
         zoom = lambda t: 1 + 0.1*t
         clips.append(img_clip.resize(zoom))
 
     concat_clip = concatenate_videoclips(clips, method="compose")
     final_clip = concat_clip.set_audio(audio)
     
-    # Add text overlay
     txt_clip = TextClip("Generated with AI", fontsize=30, color='white')
     txt_clip = txt_clip.set_pos('bottom').set_duration(final_clip.duration)
     
@@ -121,16 +133,12 @@ def create_video(images, voiceover_path, output_path):
     final_clip.write_videofile(output_path, fps=24)
 
 # 6. Quiz Generation
-def generate_quiz(script, num_questions=5):
-    sentences = script.split('.')
-    questions = []
-    for _ in range(num_questions):
-        sentence = random.choice(sentences)
-        words = sentence.split()
-        blank_word = random.choice([w for w in words if len(w) > 3])
-        question = f"Fill in the blank: {sentence.replace(blank_word, '______')}"
-        questions.append((question, blank_word))
-    return questions
+def generate_quiz_with_airoboros(model, tokenizer, script, num_questions=5):
+    prompt = f"Based on the following script, generate {num_questions} quiz questions with their answers:\n\n{script}\n\nQuiz:"
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    outputs = model.generate(**inputs, max_new_tokens=500, temperature=0.7)
+    quiz = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return quiz.split("Quiz:")[1].strip().split("\n")
 
 # 7. Analytics Dashboard
 class AnalyticsTracker:
@@ -154,34 +162,30 @@ class AnalyticsTracker:
 
 # Main process
 def main(pdf_path):
-    # Extract text from PDF
+    print("Loading Airoboros model...")
+    model, tokenizer = load_airoboros_model()
+
     print("Extracting text from PDF...")
     text = extract_text_from_pdf(pdf_path)
 
-    # Summarize text and generate script
     print("Summarizing text and generating script...")
-    summary = summarize_text(text)
-    script = generate_script(summary)
-    key_points = extract_key_points(summary)
+    summary = summarize_with_airoboros(model, tokenizer, text)
+    script = generate_script_with_airoboros(model, tokenizer, summary)
+    key_points = extract_key_points(model, tokenizer, summary)
 
-    # Generate prompts and images
     print("Generating prompts and images...")
     prompts = generate_prompts(key_points)
     images = generate_images(prompts)
 
-    # Generate voiceover
     print("Generating voiceover...")
     voiceover_path = generate_voiceover(script)
 
-    # Create video
     print("Creating video...")
     create_video(images, voiceover_path, "output_video.mp4")
 
-    # Generate quiz
     print("Generating quiz...")
-    quiz = generate_quiz(script)
+    quiz = generate_quiz_with_airoboros(model, tokenizer, script)
 
-    # Initialize analytics tracker
     analytics_tracker = AnalyticsTracker()
 
     print("Video created successfully!")
