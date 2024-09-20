@@ -32,7 +32,7 @@ def extract_text_from_pdf(pdf_path):
             text += line[1][0] + "\n"
     return text
 
-def chunk_text(text, max_length=2000):
+def chunk_text(text, max_length=5000):  # Increased max_length for larger corporate docs
     words = text.split()
     chunks = []
     current_chunk = []
@@ -50,38 +50,38 @@ def chunk_text(text, max_length=2000):
     return chunks if chunks else [text]  # Return the original text if it's smaller than max_length
 
 def summarize_with_airoboros(model, tokenizer, text):
-    chunks = chunk_text(text)
+    chunks = chunk_text(text)  # Process larger chunks
     summaries = []
     for chunk in chunks:
-        prompt = f"Summarize the following text concisely:\n\n{chunk}\n\nSummary:"
+        prompt = f"Summarize this corporate document section concisely:\n\n{chunk}\n\nSummary:"
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
         with torch.no_grad():
-            outputs = model.generate(**inputs, max_new_tokens=150, temperature=0.7)
+            outputs = model.generate(**inputs, max_new_tokens=300, temperature=0.7)
         summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
         summaries.append(summary.split("Summary:")[1].strip())
     return " ".join(summaries)
 
 def generate_script_with_airoboros(model, tokenizer, summary):
-    prompt = f"Based on the following summary, create a detailed script for a video presentation:\n\n{summary}\n\nScript:"
+    prompt = f"Based on this summary of a corporate document, create a detailed video presentation script:\n\n{summary}\n\nScript:"
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     with torch.no_grad():
-        outputs = model.generate(**inputs, max_new_tokens=500, temperature=0.7)
+        outputs = model.generate(**inputs, max_new_tokens=1000, temperature=0.7)
     script = tokenizer.decode(outputs[0], skip_special_tokens=True)
     return script.split("Script:")[1].strip()
 
-def extract_key_points(model, tokenizer, summary, n=5):
-    prompt = f"Extract {n} key points from the following summary:\n\n{summary}\n\nKey points:"
+def extract_key_points(model, tokenizer, summary, n=7):  # Increased key points for corporate depth
+    prompt = f"Extract {n} key points from this corporate summary:\n\n{summary}\n\nKey points:"
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     with torch.no_grad():
-        outputs = model.generate(**inputs, max_new_tokens=200, temperature=0.7)
+        outputs = model.generate(**inputs, max_new_tokens=250, temperature=0.7)
     key_points = tokenizer.decode(outputs[0], skip_special_tokens=True)
     return key_points.split("Key points:")[1].strip().split("\n")
 
-# 2. Prompt Generation
+# 2. Prompt Generation for Image Creation
 def generate_prompts(key_points):
     prompts = []
     for point in key_points:
-        prompt = f"Create a photorealistic image depicting {point}. High quality, detailed, 4K resolution."
+        prompt = f"Create a professional, high-quality image that visually represents the following corporate message: '{point}'."
         prompts.append(prompt)
     return prompts
 
@@ -98,7 +98,7 @@ def generate_images(prompts):
     pipe = pipe.to("cuda")
 
     images = []
-    with ThreadPoolExecutor(max_workers=2) as executor:  # Limit concurrent generations
+    with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(generate_image, pipe, prompt) for prompt in prompts]
         for future in as_completed(futures):
             images.append(future.result())
@@ -115,10 +115,7 @@ def generate_voiceover(script):
     
     y, sr = librosa.load("voiceover.wav")
     
-    # Optimized noise reduction
     y_reduced_noise = librosa.effects.remix(y, intervals=librosa.effects.split(y, top_db=30))
-    
-    # Faster time stretching
     y_fast = librosa.effects.time_stretch(y_reduced_noise, rate=1.05)
     
     wavfile.write("processed_voiceover.wav", sr, (y_fast * 32767).astype(np.int16))
@@ -134,8 +131,7 @@ def create_video(images, voiceover_path, output_path):
     for img in images:
         img_array = np.array(img)
         img_clip = ImageClip(img_array).set_duration(duration/len(images))
-        zoom = lambda t: 1 + 0.05*t  # Reduced zoom effect for smoother transitions
-        clips.append(img_clip.resize(zoom))
+        clips.append(img_clip.resize(lambda t: 1 + 0.05*t))  # Reduced zoom effect
 
     concat_clip = concatenate_videoclips(clips, method="compose")
     final_clip = concat_clip.set_audio(audio)
@@ -145,14 +141,11 @@ def create_video(images, voiceover_path, output_path):
     
     final_clip = CompositeVideoClip([final_clip, txt_clip])
     
-    final_clip.write_videofile(output_path, fps=24, threads=4)  # Use multiple threads for faster encoding
+    final_clip.write_videofile(output_path, fps=24, threads=4)
 
 # 6. Quiz Generation
-def generate_quiz_with_airoboros(model, tokenizer, script, num_questions=5):
-    sentences = script.split('.')
-    num_questions = min(num_questions, len(sentences))  # Ensure we don't ask for more questions than sentences
-    
-    prompt = f"Based on the following script, generate {num_questions} quiz questions with their answers:\n\n{script}\n\nQuiz:"
+def generate_quiz_with_airoboros(model, tokenizer, script, num_questions=7):  # More questions for detailed documents
+    prompt = f"Based on the following script, generate {num_questions} quiz questions with answers:\n\n{script}\n\nQuiz:"
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     with torch.no_grad():
         outputs = model.generate(**inputs, max_new_tokens=500, temperature=0.7)
