@@ -12,6 +12,7 @@ from pydub import AudioSegment
 from scipy.io import wavfile
 import librosa
 import cv2
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Load Airoboros model
 def load_airoboros_model():
@@ -46,7 +47,7 @@ def chunk_text(text, max_length=2000):
             current_length += len(word) + 1
     if current_chunk:
         chunks.append(" ".join(current_chunk))
-    return chunks
+    return chunks if chunks else [text]  # Return the original text if it's smaller than max_length
 
 def summarize_with_airoboros(model, tokenizer, text):
     chunks = chunk_text(text)
@@ -54,7 +55,8 @@ def summarize_with_airoboros(model, tokenizer, text):
     for chunk in chunks:
         prompt = f"Summarize the following text concisely:\n\n{chunk}\n\nSummary:"
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-        outputs = model.generate(**inputs, max_new_tokens=150, temperature=0.7)
+        with torch.no_grad():
+            outputs = model.generate(**inputs, max_new_tokens=150, temperature=0.7)
         summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
         summaries.append(summary.split("Summary:")[1].strip())
     return " ".join(summaries)
@@ -62,14 +64,16 @@ def summarize_with_airoboros(model, tokenizer, text):
 def generate_script_with_airoboros(model, tokenizer, summary):
     prompt = f"Based on the following summary, create a detailed script for a video presentation:\n\n{summary}\n\nScript:"
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    outputs = model.generate(**inputs, max_new_tokens=500, temperature=0.7)
+    with torch.no_grad():
+        outputs = model.generate(**inputs, max_new_tokens=500, temperature=0.7)
     script = tokenizer.decode(outputs[0], skip_special_tokens=True)
     return script.split("Script:")[1].strip()
 
 def extract_key_points(model, tokenizer, summary, n=5):
     prompt = f"Extract {n} key points from the following summary:\n\n{summary}\n\nKey points:"
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    outputs = model.generate(**inputs, max_new_tokens=200, temperature=0.7)
+    with torch.no_grad():
+        outputs = model.generate(**inputs, max_new_tokens=200, temperature=0.7)
     key_points = tokenizer.decode(outputs[0], skip_special_tokens=True)
     return key_points.split("Key points:")[1].strip().split("\n")
 
@@ -82,6 +86,11 @@ def generate_prompts(key_points):
     return prompts
 
 # 3. Visual Creation
+def generate_image(pipe, prompt):
+    with torch.no_grad():
+        image = pipe(prompt, num_inference_steps=50, guidance_scale=7.5).images[0]
+    return image
+
 def generate_images(prompts):
     model_id = "CompVis/stable-diffusion-v1-4"
     pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
@@ -89,9 +98,11 @@ def generate_images(prompts):
     pipe = pipe.to("cuda")
 
     images = []
-    for prompt in prompts:
-        image = pipe(prompt, num_inference_steps=50, guidance_scale=7.5).images[0]
-        images.append(image)
+    with ThreadPoolExecutor(max_workers=2) as executor:  # Limit concurrent generations
+        futures = [executor.submit(generate_image, pipe, prompt) for prompt in prompts]
+        for future in as_completed(futures):
+            images.append(future.result())
+    
     return images
 
 # 4. Voiceover Generation
@@ -103,8 +114,12 @@ def generate_voiceover(script):
     sound.export("voiceover.wav", format="wav")
     
     y, sr = librosa.load("voiceover.wav")
-    y_reduced_noise = librosa.effects.remix(y, intervals=librosa.effects.split(y, top_db=20))
-    y_fast = librosa.effects.time_stretch(y_reduced_noise, rate=1.1)
+    
+    # Optimized noise reduction
+    y_reduced_noise = librosa.effects.remix(y, intervals=librosa.effects.split(y, top_db=30))
+    
+    # Faster time stretching
+    y_fast = librosa.effects.time_stretch(y_reduced_noise, rate=1.05)
     
     wavfile.write("processed_voiceover.wav", sr, (y_fast * 32767).astype(np.int16))
     
@@ -119,7 +134,7 @@ def create_video(images, voiceover_path, output_path):
     for img in images:
         img_array = np.array(img)
         img_clip = ImageClip(img_array).set_duration(duration/len(images))
-        zoom = lambda t: 1 + 0.1*t
+        zoom = lambda t: 1 + 0.05*t  # Reduced zoom effect for smoother transitions
         clips.append(img_clip.resize(zoom))
 
     concat_clip = concatenate_videoclips(clips, method="compose")
@@ -130,13 +145,17 @@ def create_video(images, voiceover_path, output_path):
     
     final_clip = CompositeVideoClip([final_clip, txt_clip])
     
-    final_clip.write_videofile(output_path, fps=24)
+    final_clip.write_videofile(output_path, fps=24, threads=4)  # Use multiple threads for faster encoding
 
 # 6. Quiz Generation
 def generate_quiz_with_airoboros(model, tokenizer, script, num_questions=5):
+    sentences = script.split('.')
+    num_questions = min(num_questions, len(sentences))  # Ensure we don't ask for more questions than sentences
+    
     prompt = f"Based on the following script, generate {num_questions} quiz questions with their answers:\n\n{script}\n\nQuiz:"
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    outputs = model.generate(**inputs, max_new_tokens=500, temperature=0.7)
+    with torch.no_grad():
+        outputs = model.generate(**inputs, max_new_tokens=500, temperature=0.7)
     quiz = tokenizer.decode(outputs[0], skip_special_tokens=True)
     return quiz.split("Quiz:")[1].strip().split("\n")
 
